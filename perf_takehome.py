@@ -142,6 +142,7 @@ class KernelBuilder:
     ):
         """
         Vectorized VLIW kernel - processes VLEN (8) elements per iteration.
+        Optimized with better VLIW packing.
         """
         # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
@@ -169,7 +170,7 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Preload all hash constants before the loop to avoid interleaving
+        # Preload all hash constants before the loop
         hash_consts = []
         for (op1, val1, op2, op3, val3) in HASH_STAGES:
             hash_consts.append((self.scratch_const(val1), self.scratch_const(val3)))
@@ -181,25 +182,29 @@ class KernelBuilder:
         v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
         v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
         v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
-        v_addr = self.alloc_scratch("v_addr", VLEN)  # For gather addresses
+        v_addr = self.alloc_scratch("v_addr", VLEN)
 
         # Scalar address registers
         addr_idx = self.alloc_scratch("addr_idx")
         addr_val = self.alloc_scratch("addr_val")
 
-        # Vector constants (broadcast from scalar)
+        # Vector constants
         v_zero = self.alloc_scratch("v_zero", VLEN)
         v_one = self.alloc_scratch("v_one", VLEN)
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
-        # Broadcast scalar constants to vectors
-        self.add_vliw([("valu", ("vbroadcast", v_zero, zero_const))])
-        self.add_vliw([("valu", ("vbroadcast", v_one, one_const))])
-        self.add_vliw([("valu", ("vbroadcast", v_two, two_const))])
-        self.add_vliw([("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))])
+        # Broadcast scalar constants to vectors - pack 2 per cycle
+        self.add_vliw([
+            ("valu", ("vbroadcast", v_zero, zero_const)),
+            ("valu", ("vbroadcast", v_one, one_const)),
+        ])
+        self.add_vliw([
+            ("valu", ("vbroadcast", v_two, two_const)),
+            ("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])),
+        ])
 
-        # Precompute hash constant vectors
+        # Precompute hash constant vectors - pack 2 broadcasts per cycle
         v_hash_consts = []
         for (c1, c3) in hash_consts:
             vc1 = self.alloc_scratch(None, VLEN)
@@ -213,7 +218,6 @@ class KernelBuilder:
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting vectorized loop"))
 
-        # Process batch_size/VLEN vector iterations per round
         n_vec_iters = batch_size // VLEN
 
         for round in range(rounds):
@@ -221,30 +225,34 @@ class KernelBuilder:
                 base_i = vi * VLEN
                 base_const = self.scratch_const(base_i)
 
-                # Calculate base addresses for this vector iteration
+                # PACK: Calculate base addresses + vbroadcast forest_values_p
                 self.add_vliw([
                     ("alu", ("+", addr_idx, self.scratch["inp_indices_p"], base_const)),
                     ("alu", ("+", addr_val, self.scratch["inp_values_p"], base_const)),
+                    ("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"])),
                 ])
 
-                # Vector load idx[base_i:base_i+8] and val[base_i:base_i+8]
+                # Vector load idx and val
                 self.add_vliw([
                     ("load", ("vload", v_idx, addr_idx)),
                     ("load", ("vload", v_val, addr_val)),
                 ])
 
-                # Debug compares for each element
                 self.add_vliw([
                     ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "idx") for j in range(VLEN)))),
                     ("debug", ("vcompare", v_val, tuple((round, base_i + j, "val") for j in range(VLEN)))),
                 ])
 
-                # Gather node_val: compute addresses v_addr[j] = forest_values_p + v_idx[j]
-                self.add_vliw([("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))])
+                # Compute gather addresses
                 self.add_vliw([("valu", ("+", v_addr, v_addr, v_idx))])
 
-                # Gather: load 8 tree values (2 loads per cycle, 4 cycles total)
-                for lo in range(0, VLEN, 2):
+                # Gather with multiply packed in first cycle
+                self.add_vliw([
+                    ("load", ("load_offset", v_node_val, v_addr, 0)),
+                    ("load", ("load_offset", v_node_val, v_addr, 1)),
+                    ("valu", ("*", v_idx, v_idx, v_two)),
+                ])
+                for lo in range(2, VLEN, 2):
                     self.add_vliw([
                         ("load", ("load_offset", v_node_val, v_addr, lo)),
                         ("load", ("load_offset", v_node_val, v_addr, lo + 1)),
@@ -254,18 +262,16 @@ class KernelBuilder:
                     ("debug", ("vcompare", v_node_val, tuple((round, base_i + j, "node_val") for j in range(VLEN)))),
                 ])
 
-                # val = myhash(val ^ node_val)
+                # XOR before hash
                 self.add_vliw([("valu", ("^", v_val, v_val, v_node_val))])
 
                 # Vector hash function
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                     vc1, vc3 = v_hash_consts[hi]
-                    # Two independent vector ops
                     self.add_vliw([
                         ("valu", (op1, v_tmp1, v_val, vc1)),
                         ("valu", (op3, v_tmp2, v_val, vc3)),
                     ])
-                    # Combine
                     self.add_vliw([("valu", (op2, v_val, v_tmp1, v_tmp2))])
                     self.add_vliw([
                         ("debug", ("vcompare", v_val, tuple((round, base_i + j, "hash_stage", hi) for j in range(VLEN)))),
@@ -276,10 +282,8 @@ class KernelBuilder:
                 ])
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.add_vliw([
-                    ("valu", ("%", v_tmp1, v_val, v_two)),
-                    ("valu", ("*", v_idx, v_idx, v_two)),
-                ])
+                # Note: v_idx * 2 was already computed during gather
+                self.add_vliw([("valu", ("%", v_tmp1, v_val, v_two))])
                 self.add_vliw([("valu", ("==", v_tmp1, v_tmp1, v_zero))])
                 self.add_vliw([("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two))])
                 self.add_vliw([("valu", ("+", v_idx, v_idx, v_tmp3))])
@@ -294,7 +298,7 @@ class KernelBuilder:
                     ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "wrapped_idx") for j in range(VLEN)))),
                 ])
 
-                # Vector store idx and val back
+                # Vector store
                 self.add_vliw([
                     ("store", ("vstore", addr_idx, v_idx)),
                     ("store", ("vstore", addr_val, v_val)),
