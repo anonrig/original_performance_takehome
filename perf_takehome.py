@@ -141,13 +141,14 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Like reference_kernel2 but building actual instructions.
-        VLIW-optimized: pack independent operations into parallel slots.
+        Vectorized VLIW kernel - processes VLEN (8) elements per iteration.
         """
+        # Scalar temporaries
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
+        # Scratch space addresses for memory layout
         init_vars = [
             "rounds",
             "n_nodes",
@@ -163,93 +164,140 @@ class KernelBuilder:
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
+        # Scalar constants
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        # Preload all hash constants before the loop to avoid interleaving
+        hash_consts = []
+        for (op1, val1, op2, op3, val3) in HASH_STAGES:
+            hash_consts.append((self.scratch_const(val1), self.scratch_const(val3)))
 
-        # Scalar scratch registers - allocate TWO address registers for parallel loads
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr1 = self.alloc_scratch("tmp_addr")  # For idx address
-        tmp_addr2 = self.alloc_scratch("tmp_addr2")  # For val address
+        # Vector scratch registers (VLEN = 8 elements each)
+        v_idx = self.alloc_scratch("v_idx", VLEN)
+        v_val = self.alloc_scratch("v_val", VLEN)
+        v_node_val = self.alloc_scratch("v_node_val", VLEN)
+        v_tmp1 = self.alloc_scratch("v_tmp1", VLEN)
+        v_tmp2 = self.alloc_scratch("v_tmp2", VLEN)
+        v_tmp3 = self.alloc_scratch("v_tmp3", VLEN)
+        v_addr = self.alloc_scratch("v_addr", VLEN)  # For gather addresses
+
+        # Scalar address registers
+        addr_idx = self.alloc_scratch("addr_idx")
+        addr_val = self.alloc_scratch("addr_val")
+
+        # Vector constants (broadcast from scalar)
+        v_zero = self.alloc_scratch("v_zero", VLEN)
+        v_one = self.alloc_scratch("v_one", VLEN)
+        v_two = self.alloc_scratch("v_two", VLEN)
+        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
+
+        # Broadcast scalar constants to vectors
+        self.add_vliw([("valu", ("vbroadcast", v_zero, zero_const))])
+        self.add_vliw([("valu", ("vbroadcast", v_one, one_const))])
+        self.add_vliw([("valu", ("vbroadcast", v_two, two_const))])
+        self.add_vliw([("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))])
+
+        # Precompute hash constant vectors
+        v_hash_consts = []
+        for (c1, c3) in hash_consts:
+            vc1 = self.alloc_scratch(None, VLEN)
+            vc3 = self.alloc_scratch(None, VLEN)
+            self.add_vliw([
+                ("valu", ("vbroadcast", vc1, c1)),
+                ("valu", ("vbroadcast", vc3, c3)),
+            ])
+            v_hash_consts.append((vc1, vc3))
+
+        self.add("flow", ("pause",))
+        self.add("debug", ("comment", "Starting vectorized loop"))
+
+        # Process batch_size/VLEN vector iterations per round
+        n_vec_iters = batch_size // VLEN
 
         for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
+            for vi in range(n_vec_iters):
+                base_i = vi * VLEN
+                base_const = self.scratch_const(base_i)
 
-                # VLIW: Calculate both addresses in parallel (2 ALU slots)
+                # Calculate base addresses for this vector iteration
                 self.add_vliw([
-                    ("alu", ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const)),
-                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)),
+                    ("alu", ("+", addr_idx, self.scratch["inp_indices_p"], base_const)),
+                    ("alu", ("+", addr_val, self.scratch["inp_values_p"], base_const)),
                 ])
 
-                # VLIW: Load idx and val in parallel (2 LOAD slots)
+                # Vector load idx[base_i:base_i+8] and val[base_i:base_i+8]
                 self.add_vliw([
-                    ("load", ("load", tmp_idx, tmp_addr1)),
-                    ("load", ("load", tmp_val, tmp_addr2)),
-                ])
-                # Debug compares must be in separate instruction (reads happen before writes commit)
-                self.add_vliw([
-                    ("debug", ("compare", tmp_idx, (round, i, "idx"))),
-                    ("debug", ("compare", tmp_val, (round, i, "val"))),
+                    ("load", ("vload", v_idx, addr_idx)),
+                    ("load", ("vload", v_val, addr_val)),
                 ])
 
-                # node_val = mem[forest_values_p + idx] (sequential - depends on tmp_idx)
-                self.add_vliw([("alu", ("+", tmp_addr1, self.scratch["forest_values_p"], tmp_idx))])
-                self.add_vliw([("load", ("load", tmp_node_val, tmp_addr1))])
-                self.add_vliw([("debug", ("compare", tmp_node_val, (round, i, "node_val")))])
+                # Debug compares for each element
+                self.add_vliw([
+                    ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "idx") for j in range(VLEN)))),
+                    ("debug", ("vcompare", v_val, tuple((round, base_i + j, "val") for j in range(VLEN)))),
+                ])
+
+                # Gather node_val: compute addresses v_addr[j] = forest_values_p + v_idx[j]
+                self.add_vliw([("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"]))])
+                self.add_vliw([("valu", ("+", v_addr, v_addr, v_idx))])
+
+                # Gather: load 8 tree values (2 loads per cycle, 4 cycles total)
+                for lo in range(0, VLEN, 2):
+                    self.add_vliw([
+                        ("load", ("load_offset", v_node_val, v_addr, lo)),
+                        ("load", ("load_offset", v_node_val, v_addr, lo + 1)),
+                    ])
+
+                self.add_vliw([
+                    ("debug", ("vcompare", v_node_val, tuple((round, base_i + j, "node_val") for j in range(VLEN)))),
+                ])
 
                 # val = myhash(val ^ node_val)
-                self.add_vliw([("alu", ("^", tmp_val, tmp_val, tmp_node_val))])
+                self.add_vliw([("valu", ("^", v_val, v_val, v_node_val))])
 
-                # Hash function with VLIW packing
+                # Vector hash function
                 for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    # These two ops are independent - pack them together
+                    vc1, vc3 = v_hash_consts[hi]
+                    # Two independent vector ops
                     self.add_vliw([
-                        ("alu", (op1, tmp1, tmp_val, self.scratch_const(val1))),
-                        ("alu", (op3, tmp2, tmp_val, self.scratch_const(val3))),
+                        ("valu", (op1, v_tmp1, v_val, vc1)),
+                        ("valu", (op3, v_tmp2, v_val, vc3)),
                     ])
-                    # This depends on both tmp1 and tmp2
-                    self.add_vliw([("alu", (op2, tmp_val, tmp1, tmp2))])
-                    self.add_vliw([("debug", ("compare", tmp_val, (round, i, "hash_stage", hi)))])
+                    # Combine
+                    self.add_vliw([("valu", (op2, v_val, v_tmp1, v_tmp2))])
+                    self.add_vliw([
+                        ("debug", ("vcompare", v_val, tuple((round, base_i + j, "hash_stage", hi) for j in range(VLEN)))),
+                    ])
 
-                self.add_vliw([("debug", ("compare", tmp_val, (round, i, "hashed_val")))])
+                self.add_vliw([
+                    ("debug", ("vcompare", v_val, tuple((round, base_i + j, "hashed_val") for j in range(VLEN)))),
+                ])
 
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                # Can pack modulo and multiply in parallel (different dest regs)
                 self.add_vliw([
-                    ("alu", ("%", tmp1, tmp_val, two_const)),
-                    ("alu", ("*", tmp_idx, tmp_idx, two_const)),
+                    ("valu", ("%", v_tmp1, v_val, v_two)),
+                    ("valu", ("*", v_idx, v_idx, v_two)),
                 ])
-                self.add_vliw([("alu", ("==", tmp1, tmp1, zero_const))])
-                self.add_vliw([("flow", ("select", tmp3, tmp1, one_const, two_const))])
-                self.add_vliw([("alu", ("+", tmp_idx, tmp_idx, tmp3))])
-                self.add_vliw([("debug", ("compare", tmp_idx, (round, i, "next_idx")))])
+                self.add_vliw([("valu", ("==", v_tmp1, v_tmp1, v_zero))])
+                self.add_vliw([("flow", ("vselect", v_tmp3, v_tmp1, v_one, v_two))])
+                self.add_vliw([("valu", ("+", v_idx, v_idx, v_tmp3))])
+                self.add_vliw([
+                    ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "next_idx") for j in range(VLEN)))),
+                ])
 
                 # idx = 0 if idx >= n_nodes else idx
-                self.add_vliw([("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"]))])
-                self.add_vliw([("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const))])
-                self.add_vliw([("debug", ("compare", tmp_idx, (round, i, "wrapped_idx")))])
-
-                # VLIW: Calculate both store addresses in parallel
+                self.add_vliw([("valu", ("<", v_tmp1, v_idx, v_n_nodes))])
+                self.add_vliw([("flow", ("vselect", v_idx, v_tmp1, v_idx, v_zero))])
                 self.add_vliw([
-                    ("alu", ("+", tmp_addr1, self.scratch["inp_indices_p"], i_const)),
-                    ("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], i_const)),
+                    ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "wrapped_idx") for j in range(VLEN)))),
                 ])
 
-                # VLIW: Store both values in parallel (2 STORE slots)
+                # Vector store idx and val back
                 self.add_vliw([
-                    ("store", ("store", tmp_addr1, tmp_idx)),
-                    ("store", ("store", tmp_addr2, tmp_val)),
+                    ("store", ("vstore", addr_idx, v_idx)),
+                    ("store", ("vstore", addr_val, v_val)),
                 ])
 
         # Required to match with the yield in reference_kernel2
