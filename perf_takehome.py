@@ -194,6 +194,9 @@ class KernelBuilder:
         v_two = self.alloc_scratch("v_two", VLEN)
         v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
 
+        # Precompute constant for VLEN increment
+        vlen_const = self.scratch_const(VLEN)
+
         # Broadcast scalar constants to vectors - pack 2 per cycle
         self.add_vliw([
             ("valu", ("vbroadcast", v_zero, zero_const)),
@@ -203,6 +206,10 @@ class KernelBuilder:
             ("valu", ("vbroadcast", v_two, two_const)),
             ("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])),
         ])
+
+        # Precompute forest_values_p broadcast (constant across all iterations)
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        self.add_vliw([("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"]))])
 
         # Precompute hash constant vectors - pack 2 broadcasts per cycle
         v_hash_consts = []
@@ -221,18 +228,17 @@ class KernelBuilder:
         n_vec_iters = batch_size // VLEN
 
         for round in range(rounds):
+            # Initialize addresses at start of each round
+            self.add_vliw([
+                ("alu", ("+", addr_idx, self.scratch["inp_indices_p"], zero_const)),
+                ("alu", ("+", addr_val, self.scratch["inp_values_p"], zero_const)),
+            ])
+
             for vi in range(n_vec_iters):
                 base_i = vi * VLEN
-                base_const = self.scratch_const(base_i)
+                is_last_in_round = (vi == n_vec_iters - 1)
 
-                # PACK: Calculate base addresses + vbroadcast forest_values_p
-                self.add_vliw([
-                    ("alu", ("+", addr_idx, self.scratch["inp_indices_p"], base_const)),
-                    ("alu", ("+", addr_val, self.scratch["inp_values_p"], base_const)),
-                    ("valu", ("vbroadcast", v_addr, self.scratch["forest_values_p"])),
-                ])
-
-                # Vector load idx and val
+                # Vector load idx and val (addresses already computed)
                 self.add_vliw([
                     ("load", ("vload", v_idx, addr_idx)),
                     ("load", ("vload", v_val, addr_val)),
@@ -243,8 +249,8 @@ class KernelBuilder:
                     ("debug", ("vcompare", v_val, tuple((round, base_i + j, "val") for j in range(VLEN)))),
                 ])
 
-                # Compute gather addresses
-                self.add_vliw([("valu", ("+", v_addr, v_addr, v_idx))])
+                # Compute gather addresses: v_addr = v_forest_p + v_idx
+                self.add_vliw([("valu", ("+", v_addr, v_forest_p, v_idx))])
 
                 # Gather with multiply packed in first cycle
                 self.add_vliw([
@@ -298,11 +304,21 @@ class KernelBuilder:
                     ("debug", ("vcompare", v_idx, tuple((round, base_i + j, "wrapped_idx") for j in range(VLEN)))),
                 ])
 
-                # Vector store
-                self.add_vliw([
-                    ("store", ("vstore", addr_idx, v_idx)),
-                    ("store", ("vstore", addr_val, v_val)),
-                ])
+                # Vector store + increment addresses for next iteration
+                if is_last_in_round:
+                    # Last iteration in round - just store, no increment needed
+                    self.add_vliw([
+                        ("store", ("vstore", addr_idx, v_idx)),
+                        ("store", ("vstore", addr_val, v_val)),
+                    ])
+                else:
+                    # Pack store with address increment for next iteration
+                    self.add_vliw([
+                        ("store", ("vstore", addr_idx, v_idx)),
+                        ("store", ("vstore", addr_val, v_val)),
+                        ("alu", ("+", addr_idx, addr_idx, vlen_const)),
+                        ("alu", ("+", addr_val, addr_val, vlen_const)),
+                    ])
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
